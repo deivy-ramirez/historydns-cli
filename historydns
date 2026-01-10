@@ -1,0 +1,759 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==========================================================
+# historydnsx — DNS History bonito (AUTO: CIRCL + SecurityTrails)
+#
+# USO:
+#   historydnsx dominio.com [a|aaaa|mx|ns|soa|txt|cname|any] [show|compare|actual] [auto|circl|st] [limit]
+#
+# Defaults:
+#   - Sin tipo: A, MX, TXT, CNAME, NS
+#   - cmd: show
+#   - source: auto
+#   - limit: 200
+#
+# Features:
+# - show: histórico bonito por tipo + highlight vs DNS actual (verde si coincide / rojo si no)
+# - A/AAAA: muestra PTR (con cache local)
+# - compare:
+#     1) DNS ACTUAL (Live)
+#     2) CAMBIOS HISTÓRICOS (Oldest -> Newest) con PTR para A/AAAA
+#     3) REGISTRO DE CAMBIOS completo (todas las transiciones) con Source+Query y PTR
+#     4) DIFERENCIAS (Último histórico -> Live actual)
+#
+# Reqs: curl jq (dig recomendado; fallback host)
+# ==========================================================
+
+# -------------------------
+# Credenciales
+# -------------------------
+SECURITYTRAILS_KEY="${SECURITYTRAILS_KEY:-nUH65JVev5VR4UimxK2FpanXHOhlFFbC}"
+
+CIRCL_USER="${CIRCL_USER:-devopsengineer@altforsteri.com}"
+CIRCL_PASS="${CIRCL_PASS:-oKEfI3/WZfcJEB9j9+DWC6xRZnfSNu309fBC8YpfQYo=}"
+
+# -------------------------
+# Args
+# -------------------------
+domain="${1:-}"
+rtype_raw="${2:-}"
+cmd="${3:-show}"         # show | compare | actual | help
+source="${4:-auto}"      # auto | circl | st
+limit="${5:-200}"
+
+# -------------------------
+# Help
+# -------------------------
+if [[ -z "$domain" || "$domain" == "help" || "$domain" == "-h" || "$domain" == "--help" || "$cmd" == "help" ]]; then
+  cat <<'EOF'
+historydnsx — DNS History bonito (AUTO: CIRCL + SecurityTrails)
+
+USO
+  historydnsx dominio.com [a|aaaa|mx|ns|soa|txt|cname|any] [show|compare|actual] [auto|circl|st] [limit]
+
+POR DEFECTO
+  historydnsx dominio.com
+    -> histórico de A, MX, TXT, CNAME, NS
+
+EJEMPLOS
+  historydnsx ejemplo.com
+  historydnsx ejemplo.com a
+  historydnsx ejemplo.com mx show
+  historydnsx ejemplo.com txt compare
+  historydnsx ejemplo.com any show auto 200
+  historydnsx ejemplo.com a actual
+
+NOTAS
+- show: resalta (verde) lo que coincide con DNS actual, (rojo) lo que no.
+- compare: removidos/agregados + registro completo de cambios + live.
+- auto: CIRCL primero, ST solo si CIRCL queda corto.
+EOF
+  exit 0
+fi
+
+command -v curl >/dev/null || { echo "ERROR: curl requerido"; exit 1; }
+command -v jq   >/dev/null || { echo "ERROR: jq requerido"; exit 1; }
+
+# -------------------------
+# Colores
+# -------------------------
+if [[ -t 1 ]]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'
+  MAG=$'\033[35m'; CYAN=$'\033[36m'; GRAY=$'\033[90m'; WHITE=$'\033[37m'; BOLD=$'\033[1m'
+  RESET=$'\033[0m'
+else
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; MAG=""; CYAN=""; GRAY=""; BOLD=""; RESET=""
+fi
+
+hr() { echo "${WHITE}-------------------------------------------------------------------${RESET}"; }
+title() { echo "${BOLD}${CYAN}$1${RESET}"; }
+warn() { echo "${YELLOW}WARN:${RESET} $1"; }
+die() { echo "${RED}ERROR:${RESET} $1"; exit 1; }
+
+# -------------------------
+# Normalización dominio
+# -------------------------
+domain="${domain%/}"
+domain="${domain#https://}"; domain="${domain#http://}"
+domain="$(echo "$domain" | sed -e 's|^[^/]*//||' -e 's|/.*$||')"
+domain="${domain#www.}"
+domain="${domain#mail.}"
+if [[ "$domain" =~ .*@.* ]]; then
+  domain="$(echo "$domain" | sed -n 's/.*@//p')"
+fi
+
+# -------------------------
+# Tipo
+# -------------------------
+rtype=""
+if [[ -n "$rtype_raw" ]]; then
+  rtype="$(echo "$rtype_raw" | tr '[:lower:]' '[:upper:]')"
+  case "$rtype" in
+    A|AAAA|MX|NS|SOA|TXT|CNAME|ANY) ;;
+    *) die "Tipo no soportado: $rtype_raw (usa a|aaaa|mx|ns|soa|txt|cname|any)" ;;
+  esac
+fi
+
+# -------------------------
+# cmd
+# -------------------------
+case "$cmd" in
+  show|compare|actual) ;;
+  *) die "Comando inválido: $cmd (usa show|compare|actual)" ;;
+esac
+
+# -------------------------
+# source
+# -------------------------
+case "$source" in
+  auto|circl|st) ;;
+  *) die "Source inválido: $source (usa auto|circl|st)" ;;
+esac
+
+# -------------------------
+# Tipos
+# -------------------------
+ALL_TYPES=("A" "AAAA" "CNAME" "MX" "TXT" "NS" "SOA")
+DEFAULT_TYPES=("A" "MX" "TXT" "CNAME" "NS")
+
+TARGET_TYPES=()
+if [[ -z "$rtype" ]]; then
+  TARGET_TYPES=("${DEFAULT_TYPES[@]}")
+elif [[ "$rtype" == "ANY" ]]; then
+  TARGET_TYPES=("${ALL_TYPES[@]}")
+else
+  TARGET_TYPES=("$rtype")
+fi
+
+# ==========================================================
+# Cache
+# ==========================================================
+CACHE_DIR="$HOME/.cache/historydnsx"
+mkdir -p "$CACHE_DIR"
+safe_key() { echo "$1" | sed 's/[^a-zA-Z0-9._-]/_/g'; }
+cache_path() { echo "$CACHE_DIR/$(safe_key "$1").json"; }
+
+CACHE_TTL_SEC="${CACHE_TTL_SEC:-604800}" # 7 días
+now_epoch="$(date +%s)"
+
+cache_get() {
+  local key="$1" f mtime
+  f="$(cache_path "$key")"
+  [[ -f "$f" ]] || return 1
+  mtime="$(stat -f %m "$f" 2>/dev/null || echo 0)"
+  (( now_epoch - mtime < CACHE_TTL_SEC )) || return 1
+  cat "$f"
+}
+cache_put() { local key="$1"; cat > "$(cache_path "$key")"; }
+
+# ==========================================================
+# PTR cache + lookup (solo A/AAAA)
+# ==========================================================
+PTR_CACHE="$CACHE_DIR/ptr_cache.tsv"
+touch "$PTR_CACHE" 2>/dev/null || true
+
+ptr_cache_get() { # ip -> ptr
+  local ip="$1"
+  awk -F'\t' -v ip="$ip" '$1==ip {print $2; found=1} END{exit !found}' "$PTR_CACHE" 2>/dev/null
+}
+
+ptr_cache_put() { # ip ptr
+  local ip="$1" ptr="$2"
+  printf "%s\t%s\n" "$ip" "$ptr" >> "$PTR_CACHE"
+}
+
+ptr_lookup() { # ip -> ptr
+  local ip="$1" cached=""
+  cached="$(ptr_cache_get "$ip" 2>/dev/null || true)"
+  if [[ -n "$cached" ]]; then
+    echo "$cached"
+    return 0
+  fi
+
+  local ptr="-"
+  if command -v dig >/dev/null 2>&1; then
+    ptr="$(dig +time=2 +tries=1 +short -x "$ip" 2>/dev/null | sed 's/\.$//' | head -n1 || true)"
+  elif command -v host >/dev/null 2>&1; then
+    ptr="$(host "$ip" 2>/dev/null | awk '{print $NF}' | sed 's/\.$//' | head -n1 || true)"
+  fi
+
+  [[ -z "$ptr" ]] && ptr="-"
+  ptr_cache_put "$ip" "$ptr"
+  echo "$ptr"
+}
+
+# ==========================================================
+# CIRCL
+# ==========================================================
+fetch_circl_raw() {
+  local q="$1"
+  local key="circl_raw_${q}"
+  if cache_get "$key" >/dev/null 2>&1; then cache_get "$key"; return 0; fi
+  local out
+  out="$(curl -sS -u "${CIRCL_USER}:${CIRCL_PASS}" -H "Accept: application/json" \
+    "https://www.circl.lu/pdns/query/${q}" || true)"
+  printf "%s" "$out" | cache_put "$key"
+  printf "%s" "$out"
+}
+
+circl_to_events_tsv() {
+  # first\tlast\tTYPE\tvalue\tquery\tsource
+  local raw="$1"
+  local q="$2"
+  printf "%s\n" "$raw" | jq -r --arg Q "$q" '
+    select(type=="object")
+    | (.rrtype // "" | ascii_upcase) as $t
+    | select($t != "")
+    | (.time_first // null) as $tf
+    | (.time_last  // null) as $tl
+    | (.rdata  // "" | tostring) as $rd
+    | (.rrname // "" | tostring) as $rn
+    | ( if $rd == $Q and $rn != "" then $rn
+        elif $rn == $Q and $rd != "" then $rd
+        elif $rd != "" then $rd
+        else $rn end ) as $val
+    | [
+        (if ($tf|type)=="number" then ($tf|todateiso8601) else "-" end),
+        (if ($tl|type)=="number" then ($tl|todateiso8601) else "-" end),
+        $t,
+        $val,
+        $Q,
+        "CIRCL"
+      ] | @tsv
+  ' | awk -F'\t' 'NF>=6 && $4!=""'
+}
+
+build_queries() {
+  local d="$1"
+  printf "%s\n" \
+    "$d" \
+    "www.$d" \
+    "mail.$d" \
+    "webmail.$d" \
+    "smtp.$d" \
+    "imap.$d" \
+    "ftp.$d" \
+    | awk '!seen[$0]++'
+}
+
+# ==========================================================
+# SecurityTrails
+# ==========================================================
+fetch_st_history_type() {
+  local d="$1" type_lc="$2" lim="$3"
+  local key="st_${d}_${type_lc}_${lim}"
+  if cache_get "$key" >/dev/null 2>&1; then cache_get "$key"; return 0; fi
+  local url="https://api.securitytrails.com/v1/history/${d}/dns/${type_lc}?limit=${lim}"
+  local resp
+  resp="$(curl -sS -H "APIKEY: ${SECURITYTRAILS_KEY}" -H "Accept: application/json" "$url" || true)"
+  printf "%s" "$resp" | cache_put "$key"
+  printf "%s" "$resp"
+}
+
+st_to_events_tsv() {
+  local resp="$1" TYPE="$2" d="$3"
+  echo "$resp" | jq -r --arg T "$TYPE" --arg D "$d" '
+    def join_tokens($arr): ($arr | map(select(. != null)) | map(tostring) | join(" "));
+    def v2s:
+      if (.values != null) then
+        if (.values|type)=="array" then
+          if ((.values|length)>0) and ((.values[0]|type)=="object") then
+            (.values | map(
+              if has("ip") then .ip
+              elif has("nameserver") then .nameserver
+              elif (has("exchange") or has("host") or has("value") or has("mx") or has("target")) then
+                (((.priority // .preference // .pref // 0)|tostring) + ":" + ((.exchange // .host // .value // .mx // .target)|tostring))
+              elif has("mname") then
+                (.mname|tostring)+" "+(.rname|tostring)+" "+(.serial|tostring)+" "+(.refresh|tostring)+" "+(.retry|tostring)+" "+(.expire|tostring)+" "+(.minimum|tostring)
+              else
+                (.host // .name // .value // .data // tostring)
+              end
+            ) | join(" "))
+          else
+            join_tokens(.values)
+          end
+        else (.values|tostring) end
+      else "-" end;
+
+    .records[]? |
+      [(.first_seen // "-"), (.last_seen // "-"), $T, (v2s|gsub("\\s+";" ")), $D, "ST"] | @tsv
+  ' | awk -F'\t' 'NF>=6 && $4!=""'
+}
+
+# ==========================================================
+# Sets para comparar
+# ==========================================================
+extract_ips()   { tr ' ' '\n' | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}' | sed '/^$/d' | sort -u; }
+extract_hosts() { tr ' ' '\n' | sed 's/^"//; s/"$//; s/\.$//' | grep -E '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$' | sed '/^$/d' | sort -u; }
+extract_mx()    { tr ' ' '\n' | sed 's/^"//; s/"$//; s/\.$//' | grep -E '^[0-9]+:[A-Za-z0-9._-]+\.[A-Za-z]{2,}$' | sort -t: -k1,1n -k2,2; }
+extract_txt()   { sed 's/;;/\n/g' | sed 's/^"//; s/"$//;' | sed 's/\\"/"/g' | sed '/^[[:space:]]*$/d' | sort -u; }
+
+vals_to_set() {
+  local t="$1" v="$2"
+  case "$t" in
+    A|AAAA) printf "%s" "$v" | extract_ips ;;
+    MX)     printf "%s" "$v" | extract_mx ;;
+    TXT)    printf "%s" "$v" | extract_txt ;;
+    CNAME|NS|SOA) printf "%s" "$v" | extract_hosts ;;
+    *)      printf "%s" "$v" | tr ' ' '\n' | sed '/^$/d' | sort -u ;;
+  esac
+}
+
+# ==========================================================
+# LIVE DNS (actual)
+# ==========================================================
+live_query_type() {
+  local d="$1" T="$2" out=""
+  if command -v dig >/dev/null 2>&1; then
+    case "$T" in
+      A|AAAA) out="$(dig +time=2 +tries=1 +short "$d" "$T" 2>/dev/null | sed '/^$/d' | sort -u || true)" ;;
+      CNAME)  out="$(dig +time=2 +tries=1 +short "$d" CNAME 2>/dev/null | sed 's/\.$//' | sed '/^$/d' | sort -u || true)" ;;
+      MX)     out="$(dig +time=2 +tries=1 +short "$d" MX 2>/dev/null | awk '{print $1":"$2}' | sed 's/\.$//' | sed '/^$/d' | sort -t: -k1,1n -k2,2 || true)" ;;
+      TXT)    out="$(dig +time=2 +tries=1 +short "$d" TXT 2>/dev/null | sed 's/^"//; s/"$//' | sed 's/\\"/"/g' | sed '/^$/d' | sort -u || true)" ;;
+      NS)     out="$(dig +time=2 +tries=1 +short "$d" NS 2>/dev/null | sed 's/\.$//' | sed '/^$/d' | sort -u || true)" ;;
+      SOA)    out="$(dig +time=2 +tries=1 +short "$d" SOA 2>/dev/null | sed 's/\.$//' | sed '/^$/d' | sort -u || true)" ;;
+    esac
+  elif command -v host >/dev/null 2>&1; then
+    case "$T" in
+      A)     out="$(host -t A "$d" 2>/dev/null | awk '/has address/{print $NF}' | sort -u || true)" ;;
+      AAAA)  out="$(host -t AAAA "$d" 2>/dev/null | awk '/has IPv6 address/{print $NF}' | sort -u || true)" ;;
+      MX)    out="$(host -t MX "$d" 2>/dev/null | awk '/mail is handled/{print $7":"$NF}' | sed 's/\.$//' | sort -u || true)" ;;
+      NS)    out="$(host -t NS "$d" 2>/dev/null | awk '/name server/{print $NF}' | sed 's/\.$//' | sort -u || true)" ;;
+      TXT)   out="$(host -t TXT "$d" 2>/dev/null | sed -n 's/.*descriptive text "\(.*\)".*/\1/p' | sort -u || true)" ;;
+      CNAME) out="$(host -t CNAME "$d" 2>/dev/null | awk '/is an alias/{print $NF}' | sed 's/\.$//' | sort -u || true)" ;;
+      SOA)   out="$(host -t SOA "$d" 2>/dev/null | sed 's/\.$//' | sed '/^$/d' || true)" ;;
+    esac
+  fi
+
+  if [[ -n "$out" ]]; then
+    while read -r v; do
+      [[ -z "$v" ]] && continue
+      printf "%s\t%s\n" "$T" "$v"
+    done <<< "$out"
+  fi
+}
+
+live_snapshot_types() {
+  local d="$1"; shift
+  local types=("$@")
+  for T in "${types[@]}"; do
+    live_query_type "$d" "$T" || true
+  done | sed '/^$/d' | sort -u
+}
+
+# ==========================================================
+# AUTO policy
+# ==========================================================
+AUTO_MIN_ROWS="${AUTO_MIN_ROWS:-20}"
+AUTO_MIN_AGE_DAYS="${AUTO_MIN_AGE_DAYS:-365}"
+min_age_sec="$((AUTO_MIN_AGE_DAYS * 86400))"
+
+iso_to_epoch_bsd() {
+  local iso="$1"
+  [[ "$iso" == "-" || -z "$iso" ]] && { echo "0"; return; }
+  date -j -f "%Y-%m-%dT%H:%M:%SZ" "$iso" "+%s" 2>/dev/null || echo "0"
+}
+
+# ==========================================================
+# Get events
+# output: first\tlast\tTYPE\tvalue\tquery\tsource
+# ==========================================================
+get_events() {
+  local d="$1" src="$2"
+  local events_circl="" events_st=""
+
+  # CIRCL
+  if [[ "$src" == "auto" || "$src" == "circl" ]]; then
+    while read -r q; do
+      raw="$(fetch_circl_raw "$q")"
+      events_circl+="$(
+        circl_to_events_tsv "$raw" "$q" | awk -F'\t' 'NF>=6'
+      )"$'\n'
+    done < <(build_queries "$d")
+    events_circl="$(printf "%s\n" "$events_circl" | sed '/^$/d' | sort -u)"
+  fi
+
+  # Filtra por TARGET_TYPES
+  events_circl="$(printf "%s\n" "$events_circl" | awk -F'\t' -v TS="$(IFS=,; echo "${TARGET_TYPES[*]}")" '
+    BEGIN{ split(TS,a,","); for(i in a) ok[a[i]]=1 }
+    ok[$3]==1
+  ')"
+
+  # Decide fallback ST
+  local need_st="false"
+  if [[ "$src" == "st" ]]; then
+    need_st="true"
+  elif [[ "$src" == "circl" ]]; then
+    need_st="false"
+  else
+    if [[ -z "$events_circl" ]]; then
+      need_st="true"
+    else
+      rows="$(printf "%s\n" "$events_circl" | wc -l | tr -d ' ')"
+      oldest_iso="$(printf "%s\n" "$events_circl" | awk -F'\t' '{print $1}' | sort | head -n1)"
+      oldest_epoch="$(iso_to_epoch_bsd "$oldest_iso")"
+      age="$((now_epoch - oldest_epoch))"
+      if [[ "$rows" -lt "$AUTO_MIN_ROWS" ]]; then
+        need_st="true"
+      elif (( oldest_epoch == 0 )); then
+        need_st="true"
+      elif (( age < min_age_sec )); then
+        need_st="true"
+      fi
+    fi
+  fi
+
+  # ST
+  if [[ "$need_st" == "true" ]]; then
+    if [[ -z "${SECURITYTRAILS_KEY:-}" ]]; then
+      warn "AUTO quería usar SecurityTrails pero SECURITYTRAILS_KEY está vacío. Solo CIRCL."
+    else
+      local api_lim="200"
+      for T in "${TARGET_TYPES[@]}"; do
+        tlc="$(echo "$T" | tr '[:upper:]' '[:lower:]')"
+        resp="$(fetch_st_history_type "$d" "$tlc" "$api_lim")"
+        if echo "$resp" | jq -e '.records[]?' >/dev/null 2>&1; then
+          events_st+="$(
+            st_to_events_tsv "$resp" "$T" "$d"
+          )"$'\n'
+        fi
+      done
+      events_st="$(printf "%s\n" "$events_st" | sed '/^$/d' | sort -u)"
+    fi
+  fi
+
+  { [[ -n "$events_circl" ]] && printf "%s\n" "$events_circl"; true; } \
+  | cat \
+  <( [[ -n "$events_st" ]] && printf "%s\n" "$events_st" || true ) \
+  | sed '/^$/d' \
+  | sort -u
+}
+
+# ==========================================================
+# Pretty: SHOW con highlight vs LIVE
+# ==========================================================
+print_pretty_show() {
+  local d="$1" src="$2" lim="$3"
+  local events live
+
+  events="$(get_events "$d" "$src" || true)"
+  live="$(live_snapshot_types "$d" "${TARGET_TYPES[@]}")"
+
+  title "DNS HISTORY — $d"
+  echo "${GRAY}Tipos:${RESET} ${BOLD}$(IFS=,; echo "${TARGET_TYPES[*]}")${RESET}  ${GRAY}| Fuente:${RESET} ${BOLD}$src${RESET}  ${GRAY}| limit:${RESET} $lim"
+  echo "${GRAY}Leyenda:${RESET} ${GREEN}■ en DNS actual${RESET}  ${RED}■ no está en DNS actual${RESET}"
+  hr
+
+  if [[ -z "$events" ]]; then
+    warn "No hay histórico (CIRCL/ST) para $d"
+    exit 0
+  fi
+
+  for T in "${TARGET_TYPES[@]}"; do
+    block="$(printf "%s\n" "$events" | awk -F'\t' -v T="$T" '$3==T {print}' | head -n "$lim")"
+    [[ -z "$block" ]] && continue
+
+    live_set="$(printf "%s\n" "$live" | awk -F'\t' -v T="$T" '$1==T{print $2}' | sort -u)"
+
+    echo "${BOLD}${MAG}${T}${RESET}"
+    printf "%-20s  %-20s  %-58s  %-6s  %s\n" "First seen" "Last seen" "Value" "Src" "Query"
+    echo "${WHITE}---------------------------------------------------------------------------------------------------------------${RESET}"
+
+    printf "%s\n" "$block" | while IFS=$'\t' read -r fs ls t v q s; do
+      v="$(echo "$v" | sed 's/\.$//')"
+      ev_set="$(vals_to_set "$T" "$v" || true)"
+
+      if [[ -z "$ev_set" ]]; then
+        printf "%-20s  %-20s  %-58s  %-6s  %s\n" "$fs" "$ls" "$v" "$s" "$q"
+        continue
+      fi
+
+      first_printed="false"
+      while read -r item; do
+        [[ -z "$item" ]] && continue
+
+        ptr_suffix=""
+        if [[ "$T" == "A" || "$T" == "AAAA" ]]; then
+          ptr_suffix=" ${GRAY}($(ptr_lookup "$item"))${RESET}"
+        fi
+
+        if printf "%s\n" "$live_set" | grep -Fxq -- "$item" 2>/dev/null; then
+          mark="${GREEN}■${RESET} ${GREEN}${item}${RESET}${ptr_suffix}"
+        else
+          mark="${RED}■${RESET} ${RED}${item}${RESET}${ptr_suffix}"
+        fi
+
+        if [[ "$first_printed" == "false" ]]; then
+          printf "%-20s  %-20s  %-58s  %-6s  %s\n" "$fs" "$ls" "$mark" "$s" "$q"
+          first_printed="true"
+        else
+          printf "%-20s  %-20s  %-58s  %-6s  %s\n" "" "" "$mark" "" ""
+        fi
+      done <<< "$ev_set"
+    done
+    echo
+  done
+}
+
+# ==========================================================
+# Compare helpers
+# ==========================================================
+oldest_per_type() {
+  local events="$1"
+  for T in "${TARGET_TYPES[@]}"; do
+    old="$(printf "%s\n" "$events" | awk -F'\t' -v T="$T" '$3==T' | sort -t$'\t' -k2,2 | head -n1 || true)"
+    if [[ -n "$old" ]]; then
+      v="$(printf "%s" "$old" | awk -F'\t' '{print $4}')"
+      vals_to_set "$T" "$v" | while read -r x; do
+        [[ -z "$x" ]] && continue
+        printf "%s\t%s\n" "$T" "$x"
+      done
+    fi
+  done | sort -u
+}
+
+latest_per_type() {
+  local events="$1"
+  for T in "${TARGET_TYPES[@]}"; do
+    newest="$(printf "%s\n" "$events" | awk -F'\t' -v T="$T" '$3==T' | sort -t$'\t' -k2,2 | tail -n1 || true)"
+    if [[ -n "$newest" ]]; then
+      v="$(printf "%s" "$newest" | awk -F'\t' '{print $4}')"
+      vals_to_set "$T" "$v" | while read -r x; do
+        [[ -z "$x" ]] && continue
+        printf "%s\t%s\n" "$T" "$x"
+      done
+    fi
+  done | sort -u
+}
+
+print_set_diff() {
+  local label="$1" oldset="$2" newset="$3"
+
+  echo "${BOLD}${label}${RESET}"
+
+  removed="$(comm -23 <(printf "%s\n" "$oldset") <(printf "%s\n" "$newset") || true)"
+  added="$(comm -13 <(printf "%s\n" "$oldset") <(printf "%s\n" "$newset") || true)"
+
+  if [[ -n "$removed" ]]; then
+    echo "  ${RED}- Removidos${RESET}"
+    if [[ "$label" == "A" || "$label" == "AAAA" ]]; then
+      printf "%s\n" "$removed" | while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        echo "    ${RED}- ${RESET}${ip} ${GRAY}($(ptr_lookup "$ip"))${RESET}"
+      done
+    else
+      printf "%s\n" "$removed" | sed "s/^/    ${RED}- ${RESET}/"
+    fi
+  else
+    echo "  ${WHITE}- Removidos:${RESET} (ninguno)"
+  fi
+
+  if [[ -n "$added" ]]; then
+    echo "  ${GREEN}+ Agregados${RESET}"
+    if [[ "$label" == "A" || "$label" == "AAAA" ]]; then
+      printf "%s\n" "$added" | while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        echo "    ${GREEN}+ ${RESET}${ip} ${GRAY}($(ptr_lookup "$ip"))${RESET}"
+      done
+    else
+      printf "%s\n" "$added" | sed "s/^/    ${GREEN}+ ${RESET}/"
+    fi
+  else
+    echo "  ${WHITE}+ Agregados:${RESET} (ninguno)"
+  fi
+
+  echo
+}
+
+# ==========================================================
+# Registro completo de cambios (todas las transiciones)
+# ==========================================================
+event_value_to_set() {
+  local T="$1"
+  local v="$2"
+  vals_to_set "$T" "$v" | sort -u
+}
+
+print_change_log_for_type() {
+  local events="$1"
+  local T="$2"
+
+  rows="$(printf "%s\n" "$events" | awk -F'\t' -v T="$T" '$3==T' | sort -t$'\t' -k1,1 -k2,2)"
+  [[ -z "$rows" ]] && return 0
+
+  echo "${BOLD}${MAG}REGISTRO DE CAMBIOS — ${T}${RESET}"
+
+  local prev_set="" prev_ls="" first="true"
+
+  while IFS=$'\t' read -r fs ls _type v q s; do
+    cur_set="$(event_value_to_set "$T" "$v")"
+
+    if [[ "$first" == "true" ]]; then
+      prev_set="$cur_set"
+      prev_ls="$ls"
+      first="false"
+      continue
+    fi
+
+    removed="$(comm -23 <(printf "%s\n" "$prev_set") <(printf "%s\n" "$cur_set") || true)"
+    added="$(comm -13 <(printf "%s\n" "$prev_set") <(printf "%s\n" "$cur_set") || true)"
+
+    if [[ -n "$removed" || -n "$added" ]]; then
+      echo
+      echo "${BOLD}${CYAN}${prev_ls}${RESET}  ${GRAY}→${RESET}  ${BOLD}${CYAN}${ls}${RESET}   ${GRAY}[src:${RESET}${BOLD}${s}${RESET}${GRAY} q:${RESET}${BOLD}${q}${RESET}${GRAY}]${RESET}"
+
+      if [[ -n "$removed" ]]; then
+        echo "  ${RED}- Removidos${RESET}"
+        if [[ "$T" == "A" || "$T" == "AAAA" ]]; then
+          printf "%s\n" "$removed" | while read -r ip; do
+            [[ -z "$ip" ]] && continue
+            echo "    ${RED}- ${RESET}${ip} ${GRAY}($(ptr_lookup "$ip"))${RESET}"
+          done
+        else
+          printf "%s\n" "$removed" | sed "s/^/    ${RED}- ${RESET}/"
+        fi
+      else
+        echo "  ${GRAY}- Removidos:${RESET} (ninguno)"
+      fi
+
+      if [[ -n "$added" ]]; then
+        echo "  ${GREEN}+ Agregados${RESET}"
+        if [[ "$T" == "A" || "$T" == "AAAA" ]]; then
+          printf "%s\n" "$added" | while read -r ip; do
+            [[ -z "$ip" ]] && continue
+            echo "    ${GREEN}+ ${RESET}${ip} ${GRAY}($(ptr_lookup "$ip"))${RESET}"
+          done
+        else
+          printf "%s\n" "$added" | sed "s/^/    ${GREEN}+ ${RESET}/"
+        fi
+      else
+        echo "  ${GRAY}+ Agregados:${RESET} (ninguno)"
+      fi
+    fi
+
+    prev_set="$cur_set"
+    prev_ls="$ls"
+  done <<< "$rows"
+
+  echo
+}
+
+# ==========================================================
+# Compare
+# ==========================================================
+print_pretty_compare() {
+  local d="$1" src="$2"
+
+  events="$(get_events "$d" "$src" || true)"
+  title "DNS COMPARE — $d"
+  echo "${WHITE}Tipos:${RESET} ${BOLD}$(IFS=,; echo "${TARGET_TYPES[*]}")${RESET}  ${GRAY}| Fuente:${RESET} ${BOLD}$src${RESET}"
+  hr
+
+  echo "${BOLD}${CYAN}DNS ACTUAL (Live)${RESET}"
+  live="$(live_snapshot_types "$d" "${TARGET_TYPES[@]}")"
+  if [[ -z "$live" ]]; then
+    warn "No pude resolver DNS actual (sin dig/host o sin respuesta)."
+  else
+    printf "%s\n" "$live" | awk -F'\t' '
+      { arr[$1]=arr[$1] "\n  - " $2 }
+      END { for (t in arr) print t ":" arr[t] "\n" }
+    ' | sort
+  fi
+  hr
+
+  if [[ -z "$events" ]]; then
+    warn "No hay histórico para comparar."
+    exit 0
+  fi
+
+  oldest_snapshot="$(oldest_per_type "$events")"
+  newest_snapshot="$(latest_per_type "$events")"
+
+  echo "${BOLD}${MAG}CAMBIOS HISTÓRICOS (Oldest → Newest)${RESET}"
+  for T in "${TARGET_TYPES[@]}"; do
+    oldset="$(printf "%s\n" "$oldest_snapshot" | awk -F'\t' -v T="$T" '$1==T{print $2}' | sort -u)"
+    newset="$(printf "%s\n" "$newest_snapshot" | awk -F'\t' -v T="$T" '$1==T{print $2}' | sort -u)"
+    [[ -z "$oldset" && -z "$newset" ]] && continue
+    print_set_diff "$T" "$oldset" "$newset"
+  done
+  hr
+
+  # Registro completo de cambios (todas las transiciones)
+  for T in "${TARGET_TYPES[@]}"; do
+    print_change_log_for_type "$events" "$T"
+  done
+  hr
+
+  echo "${BOLD}${BLUE}DIFERENCIAS (Último histórico → Live actual)${RESET}"
+  for T in "${TARGET_TYPES[@]}"; do
+    histset="$(printf "%s\n" "$newest_snapshot" | awk -F'\t' -v T="$T" '$1==T{print $2}' | sort -u)"
+    liveset="$(printf "%s\n" "$live" | awk -F'\t' -v T="$T" '$1==T{print $2}' | sort -u)"
+    [[ -z "$histset" && -z "$liveset" ]] && continue
+    print_set_diff "$T" "$histset" "$liveset"
+  done
+}
+
+# ==========================================================
+# Actual
+# ==========================================================
+print_actual() {
+  local d="$1"
+  title "DNS ACTUAL — $d"
+  echo "${WHITE}Tipos:${RESET} ${BOLD}$(IFS=,; echo "${TARGET_TYPES[*]}")${RESET}"
+  hr
+
+  live="$(live_snapshot_types "$d" "${TARGET_TYPES[@]}")"
+  if [[ -z "$live" ]]; then
+    warn "No pude resolver DNS actual."
+    exit 0
+  fi
+
+  # Para A/AAAA, agrega PTR en salida de actual
+  if printf "%s\n" "$live" | awk -F'\t' '$1=="A" || $1=="AAAA"' | grep -q .; then
+    printf "%s\n" "$live" | while IFS=$'\t' read -r T v; do
+      if [[ "$T" == "A" || "$T" == "AAAA" ]]; then
+        echo -e "${BOLD}${T}${RESET}\t${v} ${GRAY}($(ptr_lookup "$v"))${RESET}"
+      else
+        echo -e "${BOLD}${T}${RESET}\t${v}"
+      fi
+    done | awk -F'\t' '
+      { arr[$1]=arr[$1] "\n  - " $2 }
+      END { for (t in arr) print t ":" arr[t] "\n" }
+    ' | sort
+  else
+    printf "%s\n" "$live" | awk -F'\t' '
+      { arr[$1]=arr[$1] "\n  - " $2 }
+      END { for (t in arr) print t ":" arr[t] "\n" }
+    ' | sort
+  fi
+}
+
+# ==========================================================
+# RUN
+# ==========================================================
+case "$cmd" in
+  show)    print_pretty_show "$domain" "$source" "$limit" ;;
+  compare) print_pretty_compare "$domain" "$source" ;;
+  actual)  print_actual "$domain" ;;
+esac
