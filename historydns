@@ -28,10 +28,10 @@ set -euo pipefail
 # -------------------------
 # Credenciales
 # -------------------------
-SECURITYTRAILS_KEY="${SECURITYTRAILS_KEY:-nUH65JVev5VR4UimxK2FpanXHOhlFFbC}"
+SECURITYTRAILS_KEY="${SECURITYTRAILS_KEY:-YOUR_API_KEY_HERE}"
 
-CIRCL_USER="${CIRCL_USER:-devopsengineer@altforsteri.com}"
-CIRCL_PASS="${CIRCL_PASS:-oKEfI3/WZfcJEB9j9+DWC6xRZnfSNu309fBC8YpfQYo=}"
+CIRCL_USER="${CIRCL_USER:-USER}"
+CIRCL_PASS="${CIRCL_PASS:-PASSWORD}"
 
 # -------------------------
 # Args
