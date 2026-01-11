@@ -174,7 +174,7 @@ Tiempo normal:
 - Confirmar si un dominio antes apuntaba a otro servidor
 - Análisis cuando el cliente indica que “antes funcionaba”
 
-🧑‍💻 Autor (Deivy R)
+🧑‍💻 Autor (**Deivy Steven Ramirez Molina**)
 
 Herramienta desarrollada para uso técnico real
 Optimizada para flujos de soporte, análisis DNS y troubleshooting profesional.
