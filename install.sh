@@ -51,7 +51,7 @@ add_path_if_missing "$HOME/.zshrc"
 add_path_if_missing "$HOME/.bashrc"
 add_path_if_missing "$HOME/.profile"
 
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/bin:$PATH"
 
 # --------------------------
 # Done
