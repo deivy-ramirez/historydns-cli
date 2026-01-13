@@ -8,7 +8,7 @@ set -euo pipefail
 BIN_NAME="historydns"
 REPO_RAW="REPO_RAW="https://raw.githubusercontent.com/deivy-ramirez/historydns-cli/main""
 
-TARGET_DIR="$HOME/.local/bin"
+TARGET_DIR="$HOME/bin"
 TARGET_PATH="$TARGET_DIR/$BIN_NAME"
 
 # --------------------------
